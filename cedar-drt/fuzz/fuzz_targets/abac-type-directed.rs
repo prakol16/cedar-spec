@@ -39,6 +39,7 @@ struct FuzzTargetInput {
     /// generated entity slice
     pub entities: Entities,
     /// Should we pre-evaluate entity attributes
+    /// TODO: make this always on
     pub should_cache_entities: bool,
     /// generated policy
     pub policy: ABACPolicy,
@@ -136,34 +137,11 @@ fuzz_target!(|input: FuzzTargetInput| {
     debug!("Schema: {}\n", input.schema.schemafile_string());
     debug!("Policies: {policyset}\n");
     debug!("Entities: {}\n", input.entities);
-    let original_entities = input.entities.clone();
-    let cached_entities = if input.should_cache_entities {
-        Some(input.entities.evaluate())
-    } else {
-        None
-    };
     for q in input.requests.into_iter().map(Into::into) {
         debug!("Request : {q}");
+        // TODO: diff_tester.run_single_test should accept *evaluated entities*
         let (rust_res, total_dur) =
-            time_function(|| diff_tester.run_single_test(&q, &policyset, &original_entities));
-
-        if let Some(ref entities) = cached_entities {
-            match entities {
-                Ok(entities) => {
-                    let (cached_rust_res, _total_dur) =
-                        time_function(|| diff_tester.run_single_test(&q, &policyset, entities));
-                    assert_eq!(rust_res, cached_rust_res);
-                }
-                Err(eval_er) => match &rust_res.diagnostics.errors[0] {
-                    authorizer::AuthorizationError::AttributeEvaluationError(e) => {
-                        assert_eq!(eval_er, e)
-                    }
-                    authorizer::AuthorizationError::PolicyEvaluationError { id, error } => {
-                        panic!("Wrong error! Got policy eval error {id} {error}")
-                    }
-                },
-            }
-        }
+            time_function(|| diff_tester.run_single_test(&q, &policyset, &input.entities));
 
         info!("{}{}", TOTAL_MSG, total_dur.as_nanos());
 

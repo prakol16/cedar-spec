@@ -1,3 +1,5 @@
 [submodule "cedar"]
 	path = cedar
-	url = https://github.com/cedar-policy/cedar.git
+	url = https://github.com/prakol16/cedar.git
+        branch = partial_eval_to_sql
+

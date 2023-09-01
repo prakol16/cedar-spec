@@ -75,10 +75,11 @@ impl<'e> DifferentialTester<'e> {
         } else {
             Extensions::none()
         };
-        let eval = match Evaluator::new(r, entities, &exts) {
+        let entities_eval = match entities.clone().eval_attrs(&exts) {
             Ok(e) => e,
             Err(_) => return true, // FOR NOW just ignore errors in the restricted exprs
         };
+        let eval = Evaluator::new(r, &entities_eval, &exts).unwrap();
         let v = match eval.interpret(expr, &std::collections::HashMap::default()) {
             Ok(v) => Some(v),
             Err(e) if matches!(e.error_kind(), EvaluationErrorKind::IntegerOverflow(_)) => {

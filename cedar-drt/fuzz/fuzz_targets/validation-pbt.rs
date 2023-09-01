@@ -366,6 +366,7 @@ fuzz_target!(|input: FuzzTargetInput| {
                                 cedar_policy::EvaluationErrorKind::InvalidRestrictedExpression(_) |
                                 cedar_policy::EvaluationErrorKind::UnlinkedSlot(_) |
                                 cedar_policy::EvaluationErrorKind::FailedExtensionFunctionApplication { .. } |
+                                cedar_policy::EvaluationErrorKind::EntityRequestError(_) |
                                 cedar_policy::EvaluationErrorKind::NonValue(_) |
                                 cedar_policy::EvaluationErrorKind::RecursionLimit => None,
                             }

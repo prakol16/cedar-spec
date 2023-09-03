@@ -61,6 +61,12 @@ test = false
 doc = false
 
 [[bin]]
+name = "partial-eval-to-sql-translation"
+path = "fuzz_targets/partial-eval-to-sql-translation.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "partial-eval"
 path = "fuzz_targets/partial-eval.rs"
 test = false

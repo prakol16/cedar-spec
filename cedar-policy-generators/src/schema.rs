@@ -29,7 +29,7 @@ use crate::settings::ABACSettings;
 use crate::size_hint_utils::{size_hint_for_choose, size_hint_for_range, size_hint_for_ratio};
 use crate::{accum, gen, gen_inner, uniform};
 use arbitrary::{self, Arbitrary, Unstructured};
-use cedar_policy_core::ast::{self, Effect, PolicyID};
+use cedar_policy_core::ast::{self, Effect, PolicyID, Context, RestrictedExpr, EntityUIDEntry};
 use cedar_policy_validator::{
     ActionType, ApplySpec, AttributesOrContext, SchemaError, SchemaFragment, SchemaType,
     TypeOfAttribute, ValidatorSchema,
@@ -1103,14 +1103,27 @@ impl Schema {
         )
     }
 
-    /// generate an arbitrary `ABACRequest` conforming to the schema
-    pub fn arbitrary_request(
-        &self,
-        hierarchy: &Hierarchy,
-        u: &mut Unstructured<'_>,
-    ) -> Result<ABACRequest> {
-        // first pick one of the valid Actions
-        let (action_name, action) = self
+    /// Given a list of possible entity types, choose one of them
+    fn choose_arbitrary_uid(&self, types: Option<&Vec<SmolStr>>, hierarchy: &Hierarchy, u: &mut Unstructured<'_>) -> Result<ast::EntityUID> {
+        match types {
+            None => self.arbitrary_uid_with_optional_type(None, Some(hierarchy), u),
+            Some(types) => {
+                let ty = u.choose(types)
+                    .map_err(|e| while_doing("choosing one of the action principal/resource types".into(), e))?;
+                self.arbitrary_uid_with_optional_type(
+                    Some(
+                        ty.parse()
+                            .unwrap_or_else(|e| panic!("invalid action name {ty:?}: {e}")),
+                    ),
+                    Some(hierarchy),
+                    u,
+                )
+            }
+        }
+    }
+
+    fn arbitrary_action(&self, u: &mut Unstructured<'_>) -> (&SmolStr, &ActionType) {
+        self
             .schema
             .actions
             .iter()
@@ -1118,80 +1131,96 @@ impl Schema {
                 u.choose_index(self.schema.actions.len())
                     .expect("Failed to select action index."),
             )
-            .expect("Failed to select action from map.");
+            .expect("Failed to select action from map.")
+    }
+
+    fn arbitrary_context(&self, action: &ActionType, hierarchy: &Hierarchy, u: &mut Unstructured<'_>) -> Result<HashMap<SmolStr, RestrictedExpr>> {
+        let mut attributes: Vec<_> = action
+            .applies_to
+            .as_ref()
+            .map(|a| attrs_from_attrs_or_context(&self.schema, &a.context))
+            .iter()
+            .flat_map(|attributes| attributes.attrs.iter())
+            .collect();
+        attributes.sort();
+        let exprgenerator = self.exprgenerator(Some(hierarchy));
+        attributes
+            .iter()
+            .map(|(attr_name, attr_type)| {
+                Ok((
+                    attr_name.parse().expect("failed to parse attribute name"),
+                    exprgenerator
+                        .generate_attr_value_for_schematype(
+                            &attr_type.ty,
+                            self.settings.max_depth,
+                            u,
+                        )?
+                        .into(),
+                ))
+            })
+            .collect()
+    }
+
+    /// generate an arbitrary partial request where the resource is unknown conforming to the schema
+    pub fn arbitrary_resource_request(
+        &self,
+        hierarchy: &Hierarchy,
+        u: &mut Unstructured<'_>
+    ) -> Result<ast::Request> {
+        // first pick one of the valid Actions
+        let (action_name, action) = self.arbitrary_action(u);
         // now generate a valid request for that Action
-        Ok(ABACRequest(Request {
-            principal: match action
-                .applies_to
-                .as_ref()
-                .and_then(|at| at.principal_types.as_ref())
-            {
-                None => self.arbitrary_uid_with_optional_type(None, Some(hierarchy), u)?, // unspecified principal
-                Some(types) => {
-                    // Assert that these are vec, so it's safe to draw from directly
-                    let types: &Vec<_> = types;
-                    let ty = u.choose(types).map_err(|e| {
-                        while_doing("choosing one of the action principal types".into(), e)
-                    })?;
-                    self.arbitrary_uid_with_optional_type(
-                        Some(
-                            ty.parse()
-                                .unwrap_or_else(|e| panic!("invalid action name {ty:?}: {e}")),
-                        ),
-                        Some(hierarchy),
-                        u,
-                    )?
-                }
-            },
-            action: uid_for_action_name(self.namespace.clone(), ast::Eid::new(action_name.clone())),
-            resource: match action
-                .applies_to
-                .as_ref()
-                .and_then(|at| at.resource_types.as_ref())
-            {
-                None => self.arbitrary_uid_with_optional_type(None, Some(hierarchy), u)?, // unspecified resource
-                Some(types) => {
-                    // Assert that these are vec, so it's safe to draw from directly
-                    let types: &Vec<_> = types;
-                    let ty = u.choose(types).map_err(|e| {
-                        while_doing("choosing one of the action resource types".into(), e)
-                    })?;
-                    self.arbitrary_uid_with_optional_type(
-                        Some(
-                            ty.parse()
-                                .unwrap_or_else(|e| panic!("invalid action type {ty:?}: {e}")),
-                        ),
-                        Some(hierarchy),
-                        u,
-                    )?
-                }
-            },
-            context: {
-                let mut attributes: Vec<_> = action
+        Ok(ast::Request::new_with_unknowns(
+            EntityUIDEntry::concrete(self.choose_arbitrary_uid(
+                action
                     .applies_to
                     .as_ref()
-                    .map(|a| attrs_from_attrs_or_context(&self.schema, &a.context))
-                    .iter()
-                    .flat_map(|attributes| attributes.attrs.iter())
-                    .collect();
-                attributes.sort();
-                let exprgenerator = self.exprgenerator(Some(hierarchy));
-                attributes
-                    .iter()
-                    .map(|(attr_name, attr_type)| {
-                        Ok((
-                            attr_name.parse().expect("failed to parse attribute name"),
-                            exprgenerator
-                                .generate_attr_value_for_schematype(
-                                    &attr_type.ty,
-                                    self.settings.max_depth,
-                                    u,
-                                )?
-                                .into(),
-                        ))
-                    })
-                    .collect::<Result<_>>()?
-            },
+                    .and_then(|at| at.principal_types.as_ref()),
+                hierarchy,
+                u)?),
+            EntityUIDEntry::concrete(
+                uid_for_action_name(self.namespace.clone(), ast::Eid::new(action_name.clone())),
+            ),
+            EntityUIDEntry::Unknown(
+                action
+                    .applies_to
+                    .as_ref()
+                    .and_then(|at| at.resource_types.as_ref())
+                    .and_then(|types| u.choose(types).ok())
+                    .map(|ty| ast::Name::new(ty.parse().expect("failed to parse entity type name"), []))
+            ),
+            Some(Context::from_pairs(
+                self.arbitrary_context(action, hierarchy, u)?
+            )),
+        ))
+    }
+
+    /// generate an arbitrary `ABACRequest` conforming to the schema
+    pub fn arbitrary_request(
+        &self,
+        hierarchy: &Hierarchy,
+        u: &mut Unstructured<'_>,
+    ) -> Result<ABACRequest> {
+        // first pick one of the valid Actions
+        let (action_name, action) = self.arbitrary_action(u);
+        // now generate a valid request for that Action
+        Ok(ABACRequest(Request {
+            principal: self.choose_arbitrary_uid(
+                action
+                    .applies_to
+                    .as_ref()
+                    .and_then(|at| at.principal_types.as_ref()),
+                hierarchy,
+                u)?,
+            action: uid_for_action_name(self.namespace.clone(), ast::Eid::new(action_name.clone())),
+            resource: self.choose_arbitrary_uid(
+                action
+                    .applies_to
+                    .as_ref()
+                    .and_then(|at| at.resource_types.as_ref()),
+                hierarchy,
+                u)?,
+            context: self.arbitrary_context(action, hierarchy, u)?,
         }))
     }
     /// size hint for arbitrary_request()

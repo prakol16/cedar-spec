@@ -19,6 +19,8 @@ cedar-policy-core = { path = "../../cedar/cedar-policy-core", version = "2.*", f
 cedar-policy-validator = { path = "../../cedar/cedar-policy-validator", version = "2.*", features = ["arbitrary"] }
 cedar-policy-formatter = { path = "../../cedar/cedar-policy-formatter", version = "2.*" }
 cedar-policy-generators = { path = "../../cedar-policy-generators", version = "2.*" }
+cedar-db = { path = "../../cedar/cedar-db", version = "2.*", features = ["postgres"], optional = true }
+postgres = { version = "0.19.0", features = ["with-serde_json-1"], optional = true }
 smol_str = { version = "0.2", features = ["serde"] }
 regex = "1"
 rayon = { version = "1.5", optional = true }
@@ -32,6 +34,7 @@ features = ["v4", "fast-rng"]
 
 [features]
 prt = ["dep:rayon", "dep:rand", "dep:clap", "dep:rand_chacha"]
+sql = ["dep:cedar-db", "dep:postgres"]
 
 [lib]
 path = "src/lib.rs"
@@ -65,6 +68,7 @@ name = "partial-eval-to-sql-translation"
 path = "fuzz_targets/partial-eval-to-sql-translation.rs"
 test = false
 doc = false
+required-features = ["sql"]
 
 [[bin]]
 name = "partial-eval"

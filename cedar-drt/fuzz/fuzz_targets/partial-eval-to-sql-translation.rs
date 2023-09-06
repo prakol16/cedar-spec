@@ -16,15 +16,16 @@
 
 #![no_main]
 
-use cedar_db::dump_entities;
+use cedar_db::{dump_entities::{self, EntityTableIden, EntityAncestryTableIden, AncestryCols, DumpEntitiesError}, query_builder::translate_response_core, expr_to_query::InByTable, query_expr::QueryExprError};
 use cedar_drt::initialize_log;
-use cedar_policy::PartialValue;
-use cedar_policy_generators::{schema::Schema, abac::{ABACPolicy, ABACRequest}, settings::ABACSettings, hierarchy::HierarchyGenerator};
+use cedar_policy::{PartialValue, EntityTypeName, Decision};
+use cedar_policy_generators::{schema::Schema, abac::ABACPolicy, settings::ABACSettings, hierarchy::HierarchyGenerator, collections::{HashSet, HashMap}};
 use libfuzzer_sys::{arbitrary::{self, Arbitrary, Unstructured}, fuzz_target};
-use cedar_policy_core::{entities::{Entities, TCComputation}, authorizer::Authorizer, extensions::Extensions};
+use cedar_policy_core::{entities::{Entities, TCComputation}, authorizer::{Authorizer, ResponseKind}, extensions::Extensions, ast::{PolicySet, EntityUID}};
 use cedar_policy_core::ast;
 use log::debug;
 use postgres::{NoTls, Client, error::SqlState};
+use smol_str::SmolStr;
 
 
 /// Input expected by this fuzz target:
@@ -121,10 +122,10 @@ fn drop_some_entities(entities: Entities, u: &mut Unstructured<'_>) -> arbitrary
 
 const DB_PATH: &str = "host=localhost user=postgres dbname=db_fuzzer password=postgres";
 
-/// Suppress certain postgres errors that we intentionally ignore
-/// Returns None if we should ignore the error
-/// Panics if we should not ignore the error
-fn suppress_postgres_error<T>(v: Result<T, postgres::Error>, while_msg: &str) -> Option<T> {
+/// Suppress certain postgres errors that we intentionally ignore.
+/// Returns None if we should ignore the error.
+/// Panics if we should not ignore the error.
+fn suppress_postgres_error<T>(v: Result<T, postgres::Error>, while_msg: impl FnOnce() -> String) -> Option<T> {
     match v {
         Ok(v) => Some(v),
         Err(e) => {
@@ -135,25 +136,115 @@ fn suppress_postgres_error<T>(v: Result<T, postgres::Error>, while_msg: &str) ->
                     // We ignore this error
                     return None;
                 }
+                if e.code() == &SqlState::UNTRANSLATABLE_CHARACTER && e.detail().is_some() && e.detail().unwrap().contains(r#"\u0000"#) {
+                    // Same as above error, but this one seems to get reported when the error is thrown while parsing JSON
+                    // We ignore this error
+                    return None;
+                }
+                if e.code() == &SqlState::INDETERMINATE_DATATYPE && e.message() == "cannot determine type of empty array" {
+                    // Seaquery has a bug where it does not convert empty arrays correctly
+                    // See https://github.com/SeaQL/sea-query/issues/693
+                    return None;
+                }
             }
-            panic!("Unexpected postgres error while {}: {:?}", while_msg, e);
+            panic!("Unexpected postgres error while {}: {:?}", while_msg(), e);
+        }
+    }
+}
+
+/// Suppress certain dumpentities errors that we intentionally ignore.
+/// Returns None if we should ignore the error.
+/// Panics if we should not ignore the error.
+fn suppress_dumpentities_error<T>(v: Result<T, DumpEntitiesError>, while_msg: impl FnOnce() -> String) -> Option<T> {
+    match v {
+        Ok(v) => Some(v),
+        Err(e) => {
+            if &e == &DumpEntitiesError::QueryExprError(QueryExprError::NestedSetsError) {
+                // We ignore this error because we explicitly do not support nested sets
+                return None;
+            }
+            panic!("Unexpected DumpEntitiesError while {}: {:?}", while_msg(), e);
         }
     }
 }
 
 /// Given the entities, creates the schema "cedar" in postgres and adds the entities to the database
-fn create_entities_schema(entities: &Entities<PartialValue>, schema: &cedar_policy::Schema) -> Option<()> {
+/// Returns the id map that was used to create the schema
+fn create_entities_schema(entities: &Entities<PartialValue>, schema: &cedar_policy::Schema) -> Option<HashMap<EntityTypeName, SmolStr>> {
     let mut conn = Client::connect(DB_PATH, NoTls)
         .expect("Postgres client should exist with a user 'postgres', password 'postgres', and database 'db_fuzzer'");
     conn.batch_execute(r#"DROP SCHEMA IF EXISTS "cedar" CASCADE; CREATE SCHEMA "cedar""#)
         .expect("schema 'cedar' should be creatable");
-    let stmts = dump_entities::create_tables_postgres(entities, schema)
-        .expect("schema should be creatable")
-        .join(";");
+    let (stmts, id_map) = suppress_dumpentities_error(
+        dump_entities::create_tables_postgres(entities, schema),
+        || "creating schema query statements".into())?;
 
-    debug!("Running postgres query: {}", stmts);
-    suppress_postgres_error(conn.batch_execute(&stmts), "creating and populating entities schema")?;
-    Some(())
+    debug!("Running postgres query: {:?}", stmts);
+    suppress_postgres_error(conn.batch_execute(&stmts.join(";")), || {
+        format!("creating and populating entities schema using query {}", stmts.join(";"))
+    })?;
+    Some(id_map.into())
+}
+
+/// Check that the resources which satisfy a request q are precisely the
+/// resources that are returned by the translated sql query
+/// Note: if the request fails on any resource OR if the translation fails, then
+/// we do no test and return None
+fn match_resource_request(q: ast::Request, entities: &Entities<PartialValue>, schema: &cedar_policy::Schema, pset: &PolicySet, id_map: &HashMap<EntityTypeName, SmolStr>) -> Option<()> {
+    let ty0 = q.resource().type_name()?;
+    // let ty1 = match &ty0 {
+    //     ast::EntityType::Concrete(ty) => ty,
+    //     ast::EntityType::Unspecified => return None,
+    // };
+
+    let auth = Authorizer::new();
+    let mut allowed_resources: HashSet<EntityUID> = HashSet::new();
+
+    for entity in entities.iter() {
+        let uid = entity.uid();
+        if uid.entity_type() == &ty0 {
+            let q1 = ast::Request::new_with_unknowns(
+                q.principal().clone(),
+                q.action().clone(),
+                ast::EntityUIDEntry::concrete(uid.clone()),
+                q.context().cloned());
+            let is_auth = auth.is_authorized_parsed(&q1, pset, entities);
+            if !is_auth.diagnostics.errors.is_empty() {
+                return None;
+            }
+            if is_auth.decision == Decision::Allow {
+                allowed_resources.insert(uid);
+            }
+        }
+    }
+
+    let partial_response = auth.is_authorized_core_parsed(&q, pset, entities);
+    match partial_response {
+        ResponseKind::FullyEvaluated(_) => None,
+        ResponseKind::Partial(res) => {
+            let _ = translate_response_core(
+                &res,
+                schema,
+                // Given two entity types ty0 and ty1, return the table that holds their relationship
+                InByTable(|ty0, ty1| {
+                    Ok(Some((
+                        EntityAncestryTableIden::new(ty0.clone(), ty1.clone()),
+                        AncestryCols::Descendant,
+                        AncestryCols::Ancestor,
+                    )))
+                }),
+                // Given an entity type, return the corresponding table name and id column
+                |ty| {
+                    (EntityTableIden::new(ty.clone()), id_map.get(ty)
+                        .expect("Id map should have an id for every entity in the schema")
+                        .clone())
+                }
+            )
+                // this is actually false; let's see if DRT can catch it
+                .expect("Should be able to translate query response");
+            Some(())
+        },
+    }
 }
 
 /// Check that partial evaluation + sql query gives the same result as
@@ -174,7 +265,11 @@ fn do_test(input: FuzzTargetInput) -> Option<()> {
     let entities_evaled = input.entities.eval_attrs(&exts).ok()?;
 
     // create the entities schema in postgres
-    create_entities_schema(&entities_evaled, &schema)?;
+    let id_map = create_entities_schema(&entities_evaled, &schema)?;
+
+    for q in input.resource_requests.into_iter() {
+        match_resource_request(q, &entities_evaled, &schema, &policyset, &id_map);
+    }
 
     Some(())
 }

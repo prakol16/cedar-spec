@@ -1187,7 +1187,14 @@ impl Schema {
                     .as_ref()
                     .and_then(|at| at.resource_types.as_ref())
                     .and_then(|types| u.choose(types).ok())
-                    .map(|ty| ast::Name::new(ty.parse().expect("failed to parse entity type name"), []))
+                    .map(|ty| {
+                        let id: ast::Id = ty.parse().expect("failed to parse entity type name");
+                        if let Some(n) = self.namespace.clone() {
+                            ast::Name::type_in_namespace(id, n)
+                        } else {
+                            ast::Name::unqualified_name(id)
+                        }
+                    })
             ),
             Some(Context::from_pairs(
                 self.arbitrary_context(action, hierarchy, u)?

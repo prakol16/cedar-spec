@@ -16,7 +16,7 @@
 
 #![no_main]
 
-use cedar_db::{dump_entities::{self, EntityTableIden, EntityAncestryTableIden, AncestryCols, DumpEntitiesError}, query_builder::translate_response_core, expr_to_query::InByTable, query_expr::QueryExprError};
+use cedar_db::{dump_entities::{self, EntityTableIden, EntityAncestryTableIden, AncestryCols, DumpEntitiesError}, query_builder::translate_response_core, expr_to_query::InByTable, query_expr::QueryExprError, sql_common::EntitySQLId};
 use cedar_drt::initialize_log;
 use cedar_policy::{PartialValue, EntityTypeName, Decision};
 use cedar_policy_generators::{schema::Schema, abac::ABACPolicy, settings::ABACSettings, hierarchy::HierarchyGenerator, collections::{HashSet, HashMap}};
@@ -26,7 +26,7 @@ use cedar_policy_core::ast;
 use log::debug;
 use postgres::{NoTls, Client, error::SqlState};
 use smol_str::SmolStr;
-
+use ref_cast::RefCast;
 
 /// Input expected by this fuzz target:
 /// An ABAC hierarchy, policy, and 8 associated requests
@@ -125,23 +125,24 @@ const DB_PATH: &str = "host=localhost user=postgres dbname=db_fuzzer password=po
 /// Suppress certain postgres errors that we intentionally ignore.
 /// Returns None if we should ignore the error.
 /// Panics if we should not ignore the error.
-fn suppress_postgres_error<T>(v: Result<T, postgres::Error>, while_msg: impl FnOnce() -> String) -> Option<T> {
+fn suppress_postgres_error<T>(v: Result<T, postgres::Error>, while_msg: impl FnOnce() -> String, empty_array: bool) -> Option<T> {
     match v {
         Ok(v) => Some(v),
         Err(e) => {
             if let Some(e) = e.as_db_error() {
-                if e.code() == &SqlState::CHARACTER_NOT_IN_REPERTOIRE && e.message().contains("0x00") {
-                    // Postgres does not support null characters in UTF-8 strings, despite it being a valid UTF-8 character
-                    // This is due to the backend implementation being in C
-                    // We ignore this error
-                    return None;
-                }
+                // This should now be checked manually
+                // if e.code() == &SqlState::CHARACTER_NOT_IN_REPERTOIRE && e.message().contains("0x00") {
+                //     // Postgres does not support null characters in UTF-8 strings, despite it being a valid UTF-8 character
+                //     // This is due to the backend implementation being in C
+                //     // We ignore this error
+                //     return None;
+                // }
                 if e.code() == &SqlState::UNTRANSLATABLE_CHARACTER && e.detail().is_some() && e.detail().unwrap().contains(r#"\u0000"#) {
                     // Same as above error, but this one seems to get reported when the error is thrown while parsing JSON
                     // We ignore this error
                     return None;
                 }
-                if e.code() == &SqlState::INDETERMINATE_DATATYPE && e.message() == "cannot determine type of empty array" {
+                if empty_array && e.code() == &SqlState::INDETERMINATE_DATATYPE && e.message() == "cannot determine type of empty array" {
                     // Seaquery has a bug where it does not convert empty arrays correctly
                     // See https://github.com/SeaQL/sea-query/issues/693
                     return None;
@@ -178,11 +179,17 @@ fn create_entities_schema(entities: &Entities<PartialValue>, schema: &cedar_poli
     let (stmts, id_map) = suppress_dumpentities_error(
         dump_entities::create_tables_postgres(entities, schema),
         || "creating schema query statements".into())?;
-
     debug!("Running postgres query: {:?}", stmts);
+    let stmts_joined = stmts.join(";");
+    if stmts_joined.contains('\0') {
+        // Postgres does not support null characters in UTF-8 strings, despite it being a valid UTF-8 character
+        // This is due to the backend implementation being in C
+        // We ignore this error
+        return None;
+    }
     suppress_postgres_error(conn.batch_execute(&stmts.join(";")), || {
         format!("creating and populating entities schema using query {}", stmts.join(";"))
-    })?;
+    }, true)?;
     Some(id_map.into())
 }
 
@@ -192,10 +199,11 @@ fn create_entities_schema(entities: &Entities<PartialValue>, schema: &cedar_poli
 /// we do no test and return None
 fn match_resource_request(q: ast::Request, entities: &Entities<PartialValue>, schema: &cedar_policy::Schema, pset: &PolicySet, id_map: &HashMap<EntityTypeName, SmolStr>) -> Option<()> {
     let ty0 = q.resource().type_name()?;
-    // let ty1 = match &ty0 {
-    //     ast::EntityType::Concrete(ty) => ty,
-    //     ast::EntityType::Unspecified => return None,
-    // };
+    let ty1 = match &ty0 {
+        ast::EntityType::Concrete(ty) => ty,
+        ast::EntityType::Unspecified => return None,
+    };
+    let ty2 = EntityTypeName::ref_cast(ty1);
 
     let auth = Authorizer::new();
     let mut allowed_resources: HashSet<EntityUID> = HashSet::new();
@@ -222,26 +230,53 @@ fn match_resource_request(q: ast::Request, entities: &Entities<PartialValue>, sc
     match partial_response {
         ResponseKind::FullyEvaluated(_) => None,
         ResponseKind::Partial(res) => {
-            let _ = translate_response_core(
+            let mut conn = Client::connect(DB_PATH, NoTls)
+                .expect("Should be able to connect to db");
+            let result = translate_response_core(
                 &res,
                 schema,
                 // Given two entity types ty0 and ty1, return the table that holds their relationship
                 InByTable(|ty0, ty1| {
-                    Ok(Some((
-                        EntityAncestryTableIden::new(ty0.clone(), ty1.clone()),
-                        AncestryCols::Descendant,
-                        AncestryCols::Ancestor,
-                    )))
+                    if schema.can_be_descendant(ty0, ty1) {
+                        Ok(Some((
+                            EntityAncestryTableIden::new(ty0.clone(), ty1.clone()),
+                            AncestryCols::Descendant,
+                            AncestryCols::Ancestor,
+                        )))
+                    } else {
+                        Ok(None)
+                    }
                 }),
                 // Given an entity type, return the corresponding table name and id column
                 |ty| {
                     (EntityTableIden::new(ty.clone()), id_map.get(ty)
                         .expect("Id map should have an id for every entity in the schema")
                         .clone())
+                },
+                Some(("resource", ty2))
+            );
+            if let Ok(mut result) = result {
+                result.query_default()
+                    .unwrap_or_else(|_| panic!("There is not a single unique unknown in the query {:?}", result));
+                let query = result.to_string_postgres();
+                if query.contains('\0') {
+                    // Postgres does not support null characters in UTF-8 strings, despite it being a valid UTF-8 character
+                    // This is due to the backend implementation being in C
+                    // We ignore this error
+                    return None;
                 }
-            )
-                // this is actually false; let's see if DRT can catch it
-                .expect("Should be able to translate query response");
+                let rows = suppress_postgres_error(conn.query(&query, &[]),
+                    || format!("querying postgres with query {}", query), false)?;
+
+                let rows_set = rows.into_iter().map(|row| {
+                    let id: EntitySQLId = row.get(0);
+                    // todo: entity id -> eid conversion
+                    EntityUID::from_components(ty1.clone(), ast::Eid::new(id.id().as_ref()))
+                }).collect::<HashSet<_>>();
+                if rows_set != allowed_resources {
+                    panic!("The resources returned by the sql query {} are {:?}; does not match the resources returned by the partial evaluation {:?}", query, rows_set, allowed_resources);
+                }
+            }
             Some(())
         },
     }

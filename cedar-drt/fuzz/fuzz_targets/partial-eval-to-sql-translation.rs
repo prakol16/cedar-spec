@@ -16,7 +16,7 @@
 
 #![no_main]
 
-use cedar_db::{dump_entities::{self, EntityTableIden, EntityAncestryTableIden, AncestryCols, DumpEntitiesError}, query_builder::translate_response_core, expr_to_query::InByTable, query_expr::QueryExprError, sql_common::EntitySQLId};
+use cedar_db::{dump_entities::{self, EntityTableIden, EntityAncestryTableIden, AncestryCols, DumpEntitiesError}, query_builder::{translate_response_core, QueryBuilderError}, expr_to_query::InByTable, query_expr::QueryExprError, sql_common::EntitySQLId};
 use cedar_drt::initialize_log;
 use cedar_policy::{PartialValue, EntityTypeName, Decision};
 use cedar_policy_generators::{schema::Schema, abac::ABACPolicy, settings::ABACSettings, hierarchy::HierarchyGenerator, collections::{HashSet, HashMap}};
@@ -26,7 +26,7 @@ use cedar_policy_core::ast;
 use log::debug;
 use postgres::{NoTls, Client, error::SqlState};
 use smol_str::SmolStr;
-use ref_cast::RefCast;
+// use ref_cast::RefCast;
 
 /// Input expected by this fuzz target:
 /// An ABAC hierarchy, policy, and 8 associated requests
@@ -142,6 +142,11 @@ fn suppress_postgres_error<T>(v: Result<T, postgres::Error>, while_msg: impl FnO
                     // We ignore this error
                     return None;
                 }
+                if e.code() == &SqlState::FOREIGN_KEY_VIOLATION {
+                    // We ignore this error because sometimes the generator generates entity stores
+                    // with uids that do not exist; we purposefully ignore this situation
+                    return None;
+                }
                 if empty_array && e.code() == &SqlState::INDETERMINATE_DATATYPE && e.message() == "cannot determine type of empty array" {
                     // Seaquery has a bug where it does not convert empty arrays correctly
                     // See https://github.com/SeaQL/sea-query/issues/693
@@ -162,6 +167,11 @@ fn suppress_dumpentities_error<T>(v: Result<T, DumpEntitiesError>, while_msg: im
         Err(e) => {
             if &e == &DumpEntitiesError::QueryExprError(QueryExprError::NestedSetsError) {
                 // We ignore this error because we explicitly do not support nested sets
+                return None;
+            }
+            if matches!(e, DumpEntitiesError::IdentifierTooLong(_)) {
+                // It's too difficult to prevent long identifiers from being generated
+                // so we just ignore the error
                 return None;
             }
             panic!("Unexpected DumpEntitiesError while {}: {:?}", while_msg(), e);
@@ -203,7 +213,7 @@ fn match_resource_request(q: ast::Request, entities: &Entities<PartialValue>, sc
         ast::EntityType::Concrete(ty) => ty,
         ast::EntityType::Unspecified => return None,
     };
-    let ty2 = EntityTypeName::ref_cast(ty1);
+    // let ty2 = EntityTypeName::ref_cast(ty1);
 
     let auth = Authorizer::new();
     let mut allowed_resources: HashSet<EntityUID> = HashSet::new();
@@ -253,29 +263,36 @@ fn match_resource_request(q: ast::Request, entities: &Entities<PartialValue>, sc
                         .expect("Id map should have an id for every entity in the schema")
                         .clone())
                 },
-                Some(("resource", ty2))
+                None
             );
-            if let Ok(mut result) = result {
-                result.query_default()
-                    .unwrap_or_else(|_| panic!("There is not a single unique unknown in the query {:?}", result));
-                let query = result.to_string_postgres();
-                if query.contains('\0') {
-                    // Postgres does not support null characters in UTF-8 strings, despite it being a valid UTF-8 character
-                    // This is due to the backend implementation being in C
-                    // We ignore this error
-                    return None;
-                }
-                let rows = suppress_postgres_error(conn.query(&query, &[]),
-                    || format!("querying postgres with query {}", query), false)?;
 
-                let rows_set = rows.into_iter().map(|row| {
-                    let id: EntitySQLId = row.get(0);
-                    // todo: entity id -> eid conversion
-                    EntityUID::from_components(ty1.clone(), ast::Eid::new(id.id().as_ref()))
-                }).collect::<HashSet<_>>();
-                if rows_set != allowed_resources {
-                    panic!("The resources returned by the sql query {} are {:?}; does not match the resources returned by the partial evaluation {:?}", query, rows_set, allowed_resources);
-                }
+            match result {
+                Ok(mut result) => {
+                    result.query_default()
+                        .unwrap_or_else(|_| panic!("There is not a single unique unknown in the query {:?}", result));
+                    let query = result.to_string_postgres();
+                    if query.contains('\0') {
+                        // Postgres does not support null characters in UTF-8 strings, despite it being a valid UTF-8 character
+                        // This is due to the backend implementation being in C
+                        // We ignore this error
+                        return None;
+                    }
+                    let rows = suppress_postgres_error(conn.query(&query, &[]),
+                        || format!("querying postgres with query {}", query), false)?;
+
+                    let rows_set = rows.into_iter().map(|row| {
+                        let id: EntitySQLId = row.get(0);
+                        // todo: entity id -> eid conversion
+                        EntityUID::from_components(ty1.clone(), ast::Eid::new(id.id().as_ref()))
+                    }).collect::<HashSet<_>>();
+                    if rows_set != allowed_resources {
+                        panic!("The resources returned by the sql query {} are {:?}; does not match the resources returned by the partial evaluation {:?}", query, rows_set, allowed_resources);
+                    }
+                },
+                // TODO: consider exactly which errors are covered and which are not
+                Err(QueryBuilderError::QueryExprError(QueryExprError::ValidationError(_)))
+                | Err(QueryBuilderError::QueryExprError(QueryExprError::ActionTypeAppears(_))) => return None,
+                Err(e) => panic!("Unexpected error while translating response {} to sql query: {:?}", res.residuals.get(&ast::PolicyID::from_string("")).unwrap().to_string(), e),
             }
             Some(())
         },

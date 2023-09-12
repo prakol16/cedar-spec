@@ -156,8 +156,7 @@ fn check_residual_query_eq_allowed_set(
             (EntityTableIden::new(ty.clone()), id_map.get(ty)
                 .expect("Id map should have an id for every entity in the schema")
                 .clone())
-        },
-        None
+        }
     );
 
     match result {

@@ -16,12 +16,17 @@
 
 #![no_main]
 
+use cedar_db::query_expr::UnknownType;
 use cedar_drt::initialize_log;
 use cedar_drt_inner::sql::{get_conn, create_entities_schema, create_unknown_pool};
-use cedar_policy_generators::{schema::Schema, abac::{Type, ABACRequest}, settings::ABACSettings, hierarchy::HierarchyGenerator};
-use cedar_policy_core::{entities::{Entities, TCComputation}, extensions::Extensions};
+use cedar_policy::{PartialValue, Value, EntityTypeName};
+use cedar_policy_generators::{schema::Schema, abac::{Type, ABACRequest}, settings::ABACSettings, hierarchy::HierarchyGenerator, collections::HashMap};
+use cedar_policy_core::{entities::{Entities, TCComputation}, extensions::Extensions, evaluator::Evaluator, ast::{Expr, Literal, EntityType}};
 use cedar_policy_core::ast;
 use libfuzzer_sys::{fuzz_target, arbitrary::{Arbitrary, Unstructured, self}};
+use postgres::Client;
+use ref_cast::RefCast;
+use smol_str::SmolStr;
 
 
 /// Input expected by this fuzz target:
@@ -85,6 +90,7 @@ impl<'a> Arbitrary<'a> for FuzzTargetInput {
             Schema::arbitrary_size_hint(depth),
             HierarchyGenerator::size_hint(depth),
             Schema::arbitrary_policy_size_hint(&SETTINGS, depth),
+            Type::size_hint(depth),
             Schema::arbitrary_request_size_hint(depth),
             Schema::arbitrary_request_size_hint(depth),
             Schema::arbitrary_request_size_hint(depth),
@@ -119,6 +125,28 @@ fn drop_some_entities(entities: Entities, u: &mut Unstructured<'_>) -> arbitrary
     }
 }
 
+/// Checks that the given expression, when evaluated, results in the same value
+/// as if we translate the expression to SQL and evaluate it in postgres.
+fn check_expr(
+    e: &Expr,
+    q: ABACRequest,
+    entities_evaled: &Entities<PartialValue>,
+    substitutions: &HashMap<SmolStr, Value>,
+    conn: &mut Client,
+) -> Option<()> {
+    let extns = Extensions::none();
+    let eval = Evaluator::new(&q.0.into(), entities_evaled, &extns).ok()?;
+    let partial_result = match eval.partial_interpret(e, &Default::default()).ok()? {
+        PartialValue::Value(_) => return None,
+        PartialValue::Residual(e) => e,
+    };
+
+    let subst = partial_result.substitute(&substitutions.clone().into())
+        .expect("Substitutions should suceeed");
+
+    Some(())
+}
+
 fn do_test(input: FuzzTargetInput) -> Option<()> {
     let mut conn = get_conn();
     let unk_pool = input.schema.unknown_pool.clone();
@@ -130,7 +158,26 @@ fn do_test(input: FuzzTargetInput) -> Option<()> {
     // create the entities schema in postgres
     let _id_map = create_entities_schema(&entities_evaled, &schema, &mut conn)?;
     // add the unknown pool to the schema as well
-    create_unknown_pool(unk_pool, &mut conn)?;
+    create_unknown_pool(unk_pool.clone(), &mut conn)?;
+
+    let mut substitutions: HashMap<SmolStr, Value> = HashMap::new();
+    let mut renamings: HashMap<UnknownType, UnknownType> = HashMap::new();
+    for (unk, v) in unk_pool.mapping() {
+        let unk = SmolStr::from(unk);
+        let ety = if let Value::Lit(Literal::EntityUID(uid)) = &v {
+            if let EntityType::Concrete(ety) = uid.entity_type() {
+                Some(EntityTypeName::ref_cast(ety).clone())
+            } else { None }
+        } else { None };
+        renamings.insert(UnknownType::of_name_and_type(unk.clone(), ety),
+            // cedar is the postgresql schema (namespace) of the database we're using
+            UnknownType::NonEntityType { pfx: Some("cedar".into()), name: unk.clone() });
+        substitutions.insert(unk.clone(), v);
+    }
+
+    for q in input.requests {
+        check_expr(&input.expr, q, &entities_evaled, &substitutions,&mut conn);
+    }
 
     Some(())
 }

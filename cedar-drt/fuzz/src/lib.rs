@@ -17,6 +17,9 @@
 mod dump;
 mod prt;
 
+#[cfg(feature = "sql")]
+pub mod sql;
+
 pub use dump::*;
 pub use prt::*;
 

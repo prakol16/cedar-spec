@@ -14,11 +14,11 @@
  * limitations under the License.
  */
 
- #![no_main]
+#![no_main]
 
 use cedar_drt::initialize_log;
-use cedar_policy_generators::{schema::Schema, abac::ABACPolicy, settings::ABACSettings, hierarchy::HierarchyGenerator, collections::{HashSet, HashMap}};
-use cedar_policy_core::{entities::{Entities, TCComputation}, authorizer::{Authorizer, ResponseKind}, extensions::Extensions, ast::{PolicySet, EntityUID}};
+use cedar_policy_generators::{schema::Schema, abac::{Type, ABACRequest}, settings::ABACSettings, hierarchy::HierarchyGenerator};
+use cedar_policy_core::entities::{Entities, TCComputation};
 use cedar_policy_core::ast;
 use libfuzzer_sys::{fuzz_target, arbitrary::{Arbitrary, Unstructured, self}};
 
@@ -31,12 +31,90 @@ struct FuzzTargetInput {
     pub schema: Schema,
     /// generated entity slice
     pub entities: Entities,
+    /// the type of the generated expression
+    pub ty: Type,
+    /// generated expression
+    pub expr: ast::Expr,
+    /// requests which the expression will be evaluated against
+    pub requests: [ABACRequest; 8],
 }
 
+/// settings for this fuzz target
+const SETTINGS: ABACSettings = ABACSettings {
+    match_types: true,
+    enable_extensions: false,
+    max_depth: 7,
+    max_width: 7,
+    enable_additional_attributes: false,
+    enable_like: true,
+    enable_action_groups_and_attrs: true,
+    enable_arbitrary_func_call: false,
+    enable_unknowns: true,
+};
 
 impl<'a> Arbitrary<'a> for FuzzTargetInput {
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
-        todo!()
+        let schema = Schema::arbitrary(SETTINGS.clone(), u)?;
+        let hierarchy = schema.arbitrary_hierarchy(u)?;
+        let exprgenerator = schema.exprgenerator(Some(&hierarchy));
+        let ty = Type::arbitrary(u)?;
+        let expr = exprgenerator.generate_expr_for_type(
+            &ty,
+            schema.settings.max_depth,
+            u,
+        )?;
+        let requests = [
+            schema.arbitrary_request(&hierarchy, u)?,
+            schema.arbitrary_request(&hierarchy, u)?,
+            schema.arbitrary_request(&hierarchy, u)?,
+            schema.arbitrary_request(&hierarchy, u)?,
+            schema.arbitrary_request(&hierarchy, u)?,
+            schema.arbitrary_request(&hierarchy, u)?,
+            schema.arbitrary_request(&hierarchy, u)?,
+            schema.arbitrary_request(&hierarchy, u)?,
+        ];
+
+        let all_entities = Entities::try_from(hierarchy).map_err(|_| arbitrary::Error::NotEnoughData)?;
+        let entities = drop_some_entities(all_entities, u)?;
+        Ok(Self { schema, entities, ty, expr, requests })
+    }
+
+    fn size_hint(depth: usize) -> (usize, Option<usize>) {
+        arbitrary::size_hint::and_all(&[
+            Schema::arbitrary_size_hint(depth),
+            HierarchyGenerator::size_hint(depth),
+            Schema::arbitrary_policy_size_hint(&SETTINGS, depth),
+            Schema::arbitrary_request_size_hint(depth),
+            Schema::arbitrary_request_size_hint(depth),
+            Schema::arbitrary_request_size_hint(depth),
+            Schema::arbitrary_request_size_hint(depth),
+            Schema::arbitrary_request_size_hint(depth),
+            Schema::arbitrary_request_size_hint(depth),
+            Schema::arbitrary_request_size_hint(depth),
+            Schema::arbitrary_request_size_hint(depth),
+        ])
+    }
+}
+
+
+fn drop_some_entities(entities: Entities, u: &mut Unstructured<'_>) -> arbitrary::Result<Entities> {
+    let should_drop: bool = u.arbitrary()?;
+    if should_drop {
+        let mut set: Vec<_> = vec![];
+        for entity in entities.iter() {
+            match u.int_in_range(0..=9)? {
+                0 => (),
+                _ => {
+                    set.push(entity.clone());
+                }
+            }
+        }
+        Ok(
+            Entities::from_entities(set.into_iter(), TCComputation::AssumeAlreadyComputed)
+                .expect("Should be valid"),
+        )
+    } else {
+        Ok(entities)
     }
 }
 

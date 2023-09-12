@@ -125,7 +125,7 @@ const DB_PATH: &str = "host=localhost user=postgres dbname=db_fuzzer password=po
 /// Suppress certain postgres errors that we intentionally ignore.
 /// Returns None if we should ignore the error.
 /// Panics if we should not ignore the error.
-fn suppress_postgres_error<T>(v: Result<T, postgres::Error>, while_msg: impl FnOnce() -> String, empty_array: bool) -> Option<T> {
+fn suppress_postgres_error<T>(v: Result<T, postgres::Error>, while_msg: impl FnOnce() -> String) -> Option<T> {
     match v {
         Ok(v) => Some(v),
         Err(e) => {
@@ -147,11 +147,11 @@ fn suppress_postgres_error<T>(v: Result<T, postgres::Error>, while_msg: impl FnO
                     // with uids that do not exist; we purposefully ignore this situation
                     return None;
                 }
-                if empty_array && e.code() == &SqlState::INDETERMINATE_DATATYPE && e.message() == "cannot determine type of empty array" {
-                    // Seaquery has a bug where it does not convert empty arrays correctly
-                    // See https://github.com/SeaQL/sea-query/issues/693
-                    return None;
-                }
+                // if empty_array && e.code() == &SqlState::INDETERMINATE_DATATYPE && e.message() == "cannot determine type of empty array" {
+                //     // Seaquery has a bug where it does not convert empty arrays correctly
+                //     // See https://github.com/SeaQL/sea-query/issues/693
+                //     return None;
+                // }
             }
             panic!("Unexpected postgres error while {}: {:?}", while_msg(), e);
         }
@@ -199,7 +199,7 @@ fn create_entities_schema(entities: &Entities<PartialValue>, schema: &cedar_poli
     }
     suppress_postgres_error(conn.batch_execute(&stmts.join(";")), || {
         format!("creating and populating entities schema using query {}", stmts.join(";"))
-    }, true)?;
+    })?;
     Some(id_map.into())
 }
 
@@ -278,7 +278,7 @@ fn match_resource_request(q: ast::Request, entities: &Entities<PartialValue>, sc
                         return None;
                     }
                     let rows = suppress_postgres_error(conn.query(&query, &[]),
-                        || format!("querying postgres with query {}", query), false)?;
+                        || format!("querying postgres with query {}", query))?;
 
                     let rows_set = rows.into_iter().map(|row| {
                         let id: EntitySQLId = row.get(0);
@@ -288,13 +288,21 @@ fn match_resource_request(q: ast::Request, entities: &Entities<PartialValue>, sc
                     if rows_set != allowed_resources {
                         panic!("The resources returned by the sql query {} are {:?}; does not match the resources returned by the partial evaluation {:?}", query, rows_set, allowed_resources);
                     }
+                    Some(())
                 },
-                // TODO: consider exactly which errors are covered and which are not
+                // These errors are explicitly allowed
+                // Sometimes the input generator generates expressions that do not type check
                 Err(QueryBuilderError::QueryExprError(QueryExprError::ValidationError(_)))
-                | Err(QueryBuilderError::QueryExprError(QueryExprError::ActionTypeAppears(_))) => return None,
+                // Action types cannot be translated
+                | Err(QueryBuilderError::QueryExprError(QueryExprError::ActionTypeAppears(_)))
+                | Err(QueryBuilderError::QueryExprError(QueryExprError::ActionAttribute { .. }))
+                // Nested sets are not supported
+                | Err(QueryBuilderError::QueryExprError(QueryExprError::NestedSetsError))
+                // We cannot compare between certain "incomparable" types which contain sets at an inner level
+                // (e.g. a record containing a set)
+                | Err(QueryBuilderError::QueryExprError(QueryExprError::IncomparableTypes)) => None,
                 Err(e) => panic!("Unexpected error while translating response {} to sql query: {:?}", res.residuals.get(&ast::PolicyID::from_string("")).unwrap().to_string(), e),
             }
-            Some(())
         },
     }
 }

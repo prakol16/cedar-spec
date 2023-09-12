@@ -1161,6 +1161,76 @@ impl Schema {
             .collect()
     }
 
+    /// generates a entity uid entry from the given given action
+    fn arbitrary_entity_uid_of_action(
+        &self,
+        action: &ActionType,
+        allowed_types: impl FnOnce(&ApplySpec) -> Option<&Vec<SmolStr>>,
+        hierarchy: &Hierarchy,
+        u: &mut Unstructured<'_>
+    ) -> Result<ast::EntityUID> {
+        self.choose_arbitrary_uid(
+        action
+            .applies_to
+            .as_ref()
+            .and_then(allowed_types),
+            hierarchy,
+            u
+        )
+    }
+
+    fn arbitrary_unknown_of_action(
+        &self,
+        action: &ActionType,
+        allowed_types: impl FnOnce(&ApplySpec) -> Option<&Vec<SmolStr>>,
+        u: &mut Unstructured<'_>
+    ) -> EntityUIDEntry {
+        EntityUIDEntry::Unknown(
+            action
+            .applies_to
+            .as_ref()
+            .and_then(allowed_types)
+            .and_then(|types| u.choose(types).ok())
+            .map(|ty| {
+                let id: ast::Id = ty.parse().expect("failed to parse entity type name");
+                if let Some(n) = self.namespace.clone() {
+                    ast::Name::type_in_namespace(id, n)
+                } else {
+                    ast::Name::unqualified_name(id)
+                }
+            })
+        )
+    }
+
+    fn allow_principal_types(spec: &ApplySpec) -> Option<&Vec<SmolStr>> {
+        spec.principal_types.as_ref()
+    }
+
+    fn allow_resource_types(spec: &ApplySpec) -> Option<&Vec<SmolStr>> {
+        spec.resource_types.as_ref()
+    }
+
+    /// generate an arbitrary partial request where the principal is unknown conforming to the schema
+    pub fn arbitrary_principal_request(
+        &self,
+        hierarchy: &Hierarchy,
+        u: &mut Unstructured<'_>
+    ) -> Result<ast::Request> {
+        // first pick one of the valid Actions
+        let (action_name, action) = self.arbitrary_action(u);
+        // now generate a valid request for that Action
+        Ok(ast::Request::new_with_unknowns(
+            self.arbitrary_unknown_of_action(action, Schema::allow_principal_types, u),
+            EntityUIDEntry::concrete(
+                uid_for_action_name(self.namespace.clone(), ast::Eid::new(action_name.clone())),
+            ),
+            EntityUIDEntry::concrete(self.arbitrary_entity_uid_of_action(action, Schema::allow_resource_types, hierarchy, u)?),
+            Some(Context::from_pairs(
+                self.arbitrary_context(action, hierarchy, u)?
+            )),
+        ))
+    }
+
     /// generate an arbitrary partial request where the resource is unknown conforming to the schema
     pub fn arbitrary_resource_request(
         &self,
@@ -1171,31 +1241,11 @@ impl Schema {
         let (action_name, action) = self.arbitrary_action(u);
         // now generate a valid request for that Action
         Ok(ast::Request::new_with_unknowns(
-            EntityUIDEntry::concrete(self.choose_arbitrary_uid(
-                action
-                    .applies_to
-                    .as_ref()
-                    .and_then(|at| at.principal_types.as_ref()),
-                hierarchy,
-                u)?),
+            EntityUIDEntry::concrete(self.arbitrary_entity_uid_of_action(action, Schema::allow_principal_types, hierarchy, u)?),
             EntityUIDEntry::concrete(
                 uid_for_action_name(self.namespace.clone(), ast::Eid::new(action_name.clone())),
             ),
-            EntityUIDEntry::Unknown(
-                action
-                    .applies_to
-                    .as_ref()
-                    .and_then(|at| at.resource_types.as_ref())
-                    .and_then(|types| u.choose(types).ok())
-                    .map(|ty| {
-                        let id: ast::Id = ty.parse().expect("failed to parse entity type name");
-                        if let Some(n) = self.namespace.clone() {
-                            ast::Name::type_in_namespace(id, n)
-                        } else {
-                            ast::Name::unqualified_name(id)
-                        }
-                    })
-            ),
+            self.arbitrary_unknown_of_action(action, Schema::allow_resource_types, u),
             Some(Context::from_pairs(
                 self.arbitrary_context(action, hierarchy, u)?
             )),
@@ -1212,21 +1262,9 @@ impl Schema {
         let (action_name, action) = self.arbitrary_action(u);
         // now generate a valid request for that Action
         Ok(ABACRequest(Request {
-            principal: self.choose_arbitrary_uid(
-                action
-                    .applies_to
-                    .as_ref()
-                    .and_then(|at| at.principal_types.as_ref()),
-                hierarchy,
-                u)?,
+            principal: self.arbitrary_entity_uid_of_action(action, Schema::allow_principal_types, hierarchy, u)?,
             action: uid_for_action_name(self.namespace.clone(), ast::Eid::new(action_name.clone())),
-            resource: self.choose_arbitrary_uid(
-                action
-                    .applies_to
-                    .as_ref()
-                    .and_then(|at| at.resource_types.as_ref()),
-                hierarchy,
-                u)?,
+            resource: self.arbitrary_entity_uid_of_action(action, Schema::allow_resource_types, hierarchy, u)?,
             context: self.arbitrary_context(action, hierarchy, u)?,
         }))
     }

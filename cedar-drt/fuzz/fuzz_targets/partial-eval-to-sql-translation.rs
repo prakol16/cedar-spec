@@ -42,7 +42,11 @@ struct FuzzTargetInput {
 
     /// the resource requests (requests where resource is unknown)
     /// to try for this hierarchy and policy
-    pub resource_requests: [ast::Request; 4],
+    pub resource_requests: [ast::Request; 2],
+
+    /// the principal requests (requests where principal is unknown)
+    /// to try for this hierarchy and policy
+    pub principal_requests: [ast::Request; 2]
 }
 
 /// settings for this fuzz target
@@ -64,10 +68,11 @@ impl<'a> Arbitrary<'a> for FuzzTargetInput {
         let schema = Schema::arbitrary(SETTINGS.clone(), u)?;
         let hierarchy = schema.arbitrary_hierarchy(u)?;
         let policy = schema.arbitrary_policy(&hierarchy, u)?;
-
+        let principal_requests = [
+            schema.arbitrary_principal_request(&hierarchy, u)?,
+            schema.arbitrary_principal_request(&hierarchy, u)?,
+        ];
         let resource_requests = [
-            schema.arbitrary_resource_request(&hierarchy, u)?,
-            schema.arbitrary_resource_request(&hierarchy, u)?,
             schema.arbitrary_resource_request(&hierarchy, u)?,
             schema.arbitrary_resource_request(&hierarchy, u)?,
         ];
@@ -77,6 +82,7 @@ impl<'a> Arbitrary<'a> for FuzzTargetInput {
             schema,
             entities,
             policy,
+            principal_requests,
             resource_requests,
         })
     }
@@ -203,9 +209,83 @@ fn create_entities_schema(entities: &Entities<PartialValue>, schema: &cedar_poli
     Some(id_map.into())
 }
 
+/// Check that the entities returned by the query that comes from translating the response `res`
+/// are precisely the entities in the set `allow_set`
+fn check_residual_query_eq_allowed_set(
+    ty: &ast::Name, // the type of entity being queried
+    res: &cedar_policy_core::authorizer::PartialResponse,
+    schema: &cedar_policy::Schema,
+    id_map: &HashMap<EntityTypeName, SmolStr>,
+    allow_set: HashSet<EntityUID>
+) -> Option<()> {
+    let mut conn = Client::connect(DB_PATH, NoTls)
+                .expect("Should be able to connect to db");
+    let result = translate_response_core(
+        res,
+        schema,
+        // Given two entity types ty0 and ty1, return the table that holds their relationship
+        InByTable(|ty0, ty1| {
+            if schema.can_be_descendant(ty0, ty1) {
+                Ok(Some((
+                    EntityAncestryTableIden::new(ty0.clone(), ty1.clone()),
+                    AncestryCols::Descendant,
+                    AncestryCols::Ancestor,
+                )))
+            } else {
+                Ok(None)
+            }
+        }),
+        // Given an entity type, return the corresponding table name and id column
+        |ty| {
+            (EntityTableIden::new(ty.clone()), id_map.get(ty)
+                .expect("Id map should have an id for every entity in the schema")
+                .clone())
+        },
+        None
+    );
+
+    match result {
+        Ok(mut result) => {
+            result.query_default()
+                .unwrap_or_else(|_| panic!("There is not a single unique unknown in the query {:?}", result));
+            let query = result.to_string_postgres();
+            if query.contains('\0') {
+                // Postgres does not support null characters in UTF-8 strings, despite it being a valid UTF-8 character
+                // This is due to the backend implementation being in C
+                // We ignore this error
+                return None;
+            }
+            let rows = suppress_postgres_error(conn.query(&query, &[]),
+                || format!("querying postgres with query {}", query))?;
+
+            let rows_set = rows.into_iter().map(|row| {
+                let id: EntitySQLId = row.get(0);
+                // todo: entity id -> eid conversion
+                EntityUID::from_components(ty.clone(), ast::Eid::new(id.id().as_ref()))
+            }).collect::<HashSet<_>>();
+            if rows_set != allow_set {
+                panic!("The resources returned by the sql query {} are {:?}; does not match the resources returned by the partial evaluation {:?}", query, rows_set, allow_set);
+            }
+            Some(())
+        },
+        // These errors are explicitly allowed
+        // Sometimes the input generator generates expressions that do not type check
+        Err(QueryBuilderError::QueryExprError(QueryExprError::ValidationError(_)))
+        // Action types cannot be translated
+        | Err(QueryBuilderError::QueryExprError(QueryExprError::ActionTypeAppears(_)))
+        | Err(QueryBuilderError::QueryExprError(QueryExprError::ActionAttribute { .. }))
+        // Nested sets are not supported
+        | Err(QueryBuilderError::QueryExprError(QueryExprError::NestedSetsError))
+        // We cannot compare between certain "incomparable" types which contain sets at an inner level
+        // (e.g. a record containing a set)
+        | Err(QueryBuilderError::QueryExprError(QueryExprError::IncomparableTypes)) => None,
+        Err(e) => panic!("Unexpected error while translating response {} to sql query: {:?}", res.residuals.get(&ast::PolicyID::from_string("")).unwrap().to_string(), e),
+    }
+}
+
 /// Check that the resources which satisfy a request q are precisely the
 /// resources that are returned by the translated sql query
-/// Note: if the request fails on any resource OR if the translation fails, then
+/// Note: if the request fails on any resource OR if the translation fails with certain errors, then
 /// we do no test and return None
 fn match_resource_request(q: ast::Request, entities: &Entities<PartialValue>, schema: &cedar_policy::Schema, pset: &PolicySet, id_map: &HashMap<EntityTypeName, SmolStr>) -> Option<()> {
     let ty0 = q.resource().type_name()?;
@@ -225,7 +305,8 @@ fn match_resource_request(q: ast::Request, entities: &Entities<PartialValue>, sc
                 q.principal().clone(),
                 q.action().clone(),
                 ast::EntityUIDEntry::concrete(uid.clone()),
-                q.context().cloned());
+                q.context().cloned()
+            );
             let is_auth = auth.is_authorized_parsed(&q1, pset, entities);
             if !is_auth.diagnostics.errors.is_empty() {
                 return None;
@@ -240,70 +321,50 @@ fn match_resource_request(q: ast::Request, entities: &Entities<PartialValue>, sc
     match partial_response {
         ResponseKind::FullyEvaluated(_) => None,
         ResponseKind::Partial(res) => {
-            let mut conn = Client::connect(DB_PATH, NoTls)
-                .expect("Should be able to connect to db");
-            let result = translate_response_core(
-                &res,
-                schema,
-                // Given two entity types ty0 and ty1, return the table that holds their relationship
-                InByTable(|ty0, ty1| {
-                    if schema.can_be_descendant(ty0, ty1) {
-                        Ok(Some((
-                            EntityAncestryTableIden::new(ty0.clone(), ty1.clone()),
-                            AncestryCols::Descendant,
-                            AncestryCols::Ancestor,
-                        )))
-                    } else {
-                        Ok(None)
-                    }
-                }),
-                // Given an entity type, return the corresponding table name and id column
-                |ty| {
-                    (EntityTableIden::new(ty.clone()), id_map.get(ty)
-                        .expect("Id map should have an id for every entity in the schema")
-                        .clone())
-                },
-                None
+            check_residual_query_eq_allowed_set(ty1, &res, schema, id_map, allowed_resources)
+        }
+    }
+}
+
+/// Check that the principals which satisfy a request q are precisely the
+/// resources that are returned by the translated sql query
+/// Note: if the request fails on any resource OR if the translation fails with certain errors, then
+/// we do no test and return None
+fn match_principal_request(q: ast::Request, entities: &Entities<PartialValue>, schema: &cedar_policy::Schema, pset: &PolicySet, id_map: &HashMap<EntityTypeName, SmolStr>) -> Option<()> {
+    let ty0 = q.principal().type_name()?;
+    let ty1 = match &ty0 {
+        ast::EntityType::Concrete(ty) => ty,
+        ast::EntityType::Unspecified => return None,
+    };
+
+    let auth = Authorizer::new();
+    let mut allowed_principals: HashSet<EntityUID> = HashSet::new();
+
+    for entity in entities.iter() {
+        let uid = entity.uid();
+        if uid.entity_type() == &ty0 {
+            let q1 = ast::Request::new_with_unknowns(
+                ast::EntityUIDEntry::concrete(uid.clone()),
+                q.action().clone(),
+                q.resource().clone(),
+                q.context().cloned()
             );
-
-            match result {
-                Ok(mut result) => {
-                    result.query_default()
-                        .unwrap_or_else(|_| panic!("There is not a single unique unknown in the query {:?}", result));
-                    let query = result.to_string_postgres();
-                    if query.contains('\0') {
-                        // Postgres does not support null characters in UTF-8 strings, despite it being a valid UTF-8 character
-                        // This is due to the backend implementation being in C
-                        // We ignore this error
-                        return None;
-                    }
-                    let rows = suppress_postgres_error(conn.query(&query, &[]),
-                        || format!("querying postgres with query {}", query))?;
-
-                    let rows_set = rows.into_iter().map(|row| {
-                        let id: EntitySQLId = row.get(0);
-                        // todo: entity id -> eid conversion
-                        EntityUID::from_components(ty1.clone(), ast::Eid::new(id.id().as_ref()))
-                    }).collect::<HashSet<_>>();
-                    if rows_set != allowed_resources {
-                        panic!("The resources returned by the sql query {} are {:?}; does not match the resources returned by the partial evaluation {:?}", query, rows_set, allowed_resources);
-                    }
-                    Some(())
-                },
-                // These errors are explicitly allowed
-                // Sometimes the input generator generates expressions that do not type check
-                Err(QueryBuilderError::QueryExprError(QueryExprError::ValidationError(_)))
-                // Action types cannot be translated
-                | Err(QueryBuilderError::QueryExprError(QueryExprError::ActionTypeAppears(_)))
-                | Err(QueryBuilderError::QueryExprError(QueryExprError::ActionAttribute { .. }))
-                // Nested sets are not supported
-                | Err(QueryBuilderError::QueryExprError(QueryExprError::NestedSetsError))
-                // We cannot compare between certain "incomparable" types which contain sets at an inner level
-                // (e.g. a record containing a set)
-                | Err(QueryBuilderError::QueryExprError(QueryExprError::IncomparableTypes)) => None,
-                Err(e) => panic!("Unexpected error while translating response {} to sql query: {:?}", res.residuals.get(&ast::PolicyID::from_string("")).unwrap().to_string(), e),
+            let is_auth = auth.is_authorized_parsed(&q1, pset, entities);
+            if !is_auth.diagnostics.errors.is_empty() {
+                return None;
             }
-        },
+            if is_auth.decision == Decision::Allow {
+                allowed_principals.insert(uid);
+            }
+        }
+    }
+
+    let partial_response = auth.is_authorized_core_parsed(&q, pset, entities);
+    match partial_response {
+        ResponseKind::FullyEvaluated(_) => None,
+        ResponseKind::Partial(res) => {
+            check_residual_query_eq_allowed_set(ty1, &res, schema, id_map, allowed_principals)
+        }
     }
 }
 
@@ -327,7 +388,11 @@ fn do_test(input: FuzzTargetInput) -> Option<()> {
     // create the entities schema in postgres
     let id_map = create_entities_schema(&entities_evaled, &schema)?;
 
-    for q in input.resource_requests.into_iter() {
+    for q in input.principal_requests {
+        match_principal_request(q, &entities_evaled, &schema, &policyset, &id_map);
+    }
+
+    for q in input.resource_requests {
         match_resource_request(q, &entities_evaled, &schema, &policyset, &id_map);
     }
 

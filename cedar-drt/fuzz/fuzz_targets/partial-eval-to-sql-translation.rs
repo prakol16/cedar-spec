@@ -1,5 +1,5 @@
 /*
- * Copyright 2022-2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,7 +29,7 @@ use smol_str::SmolStr;
 // use ref_cast::RefCast;
 
 /// Input expected by this fuzz target:
-/// An ABAC hierarchy, policy, and 8 associated requests
+/// An ABAC hierarchy, policy, and 4 associated requests
 #[derive(Debug, Clone)]
 struct FuzzTargetInput {
     /// generated schema
@@ -38,7 +38,6 @@ struct FuzzTargetInput {
     pub entities: Entities,
     /// generated policy
     pub policy: ABACPolicy,
-    // TODO: add principal requests (requests where principal is unknown)
 
     /// the resource requests (requests where resource is unknown)
     /// to try for this hierarchy and policy
@@ -53,8 +52,8 @@ struct FuzzTargetInput {
 const SETTINGS: ABACSettings = ABACSettings {
     match_types: true,
     enable_extensions: false,
-    max_depth: 3,
-    max_width: 3,
+    max_depth: 7,
+    max_width: 7,
     enable_additional_attributes: false,
     enable_like: true,
     enable_action_groups_and_attrs: true,
@@ -187,9 +186,7 @@ fn suppress_dumpentities_error<T>(v: Result<T, DumpEntitiesError>, while_msg: im
 
 /// Given the entities, creates the schema "cedar" in postgres and adds the entities to the database
 /// Returns the id map that was used to create the schema
-fn create_entities_schema(entities: &Entities<PartialValue>, schema: &cedar_policy::Schema) -> Option<HashMap<EntityTypeName, SmolStr>> {
-    let mut conn = Client::connect(DB_PATH, NoTls)
-        .expect("Postgres client should exist with a user 'postgres', password 'postgres', and database 'db_fuzzer'");
+fn create_entities_schema(entities: &Entities<PartialValue>, schema: &cedar_policy::Schema, conn: &mut Client) -> Option<HashMap<EntityTypeName, SmolStr>> {
     conn.batch_execute(r#"DROP SCHEMA IF EXISTS "cedar" CASCADE; CREATE SCHEMA "cedar""#)
         .expect("schema 'cedar' should be creatable");
     let (stmts, id_map) = suppress_dumpentities_error(
@@ -216,10 +213,9 @@ fn check_residual_query_eq_allowed_set(
     res: &cedar_policy_core::authorizer::PartialResponse,
     schema: &cedar_policy::Schema,
     id_map: &HashMap<EntityTypeName, SmolStr>,
-    allow_set: HashSet<EntityUID>
+    allow_set: HashSet<EntityUID>,
+    conn: &mut Client
 ) -> Option<()> {
-    let mut conn = Client::connect(DB_PATH, NoTls)
-                .expect("Should be able to connect to db");
     let result = translate_response_core(
         res,
         schema,
@@ -287,7 +283,7 @@ fn check_residual_query_eq_allowed_set(
 /// resources that are returned by the translated sql query
 /// Note: if the request fails on any resource OR if the translation fails with certain errors, then
 /// we do no test and return None
-fn match_resource_request(q: ast::Request, entities: &Entities<PartialValue>, schema: &cedar_policy::Schema, pset: &PolicySet, id_map: &HashMap<EntityTypeName, SmolStr>) -> Option<()> {
+fn match_resource_request(q: ast::Request, entities: &Entities<PartialValue>, schema: &cedar_policy::Schema, pset: &PolicySet, id_map: &HashMap<EntityTypeName, SmolStr>, conn: &mut Client) -> Option<()> {
     let ty0 = q.resource().type_name()?;
     let ty1 = match &ty0 {
         ast::EntityType::Concrete(ty) => ty,
@@ -321,7 +317,7 @@ fn match_resource_request(q: ast::Request, entities: &Entities<PartialValue>, sc
     match partial_response {
         ResponseKind::FullyEvaluated(_) => None,
         ResponseKind::Partial(res) => {
-            check_residual_query_eq_allowed_set(ty1, &res, schema, id_map, allowed_resources)
+            check_residual_query_eq_allowed_set(ty1, &res, schema, id_map, allowed_resources, conn)
         }
     }
 }
@@ -330,7 +326,7 @@ fn match_resource_request(q: ast::Request, entities: &Entities<PartialValue>, sc
 /// resources that are returned by the translated sql query
 /// Note: if the request fails on any resource OR if the translation fails with certain errors, then
 /// we do no test and return None
-fn match_principal_request(q: ast::Request, entities: &Entities<PartialValue>, schema: &cedar_policy::Schema, pset: &PolicySet, id_map: &HashMap<EntityTypeName, SmolStr>) -> Option<()> {
+fn match_principal_request(q: ast::Request, entities: &Entities<PartialValue>, schema: &cedar_policy::Schema, pset: &PolicySet, id_map: &HashMap<EntityTypeName, SmolStr>, conn: &mut Client) -> Option<()> {
     let ty0 = q.principal().type_name()?;
     let ty1 = match &ty0 {
         ast::EntityType::Concrete(ty) => ty,
@@ -363,7 +359,7 @@ fn match_principal_request(q: ast::Request, entities: &Entities<PartialValue>, s
     match partial_response {
         ResponseKind::FullyEvaluated(_) => None,
         ResponseKind::Partial(res) => {
-            check_residual_query_eq_allowed_set(ty1, &res, schema, id_map, allowed_principals)
+            check_residual_query_eq_allowed_set(ty1, &res, schema, id_map, allowed_principals, conn)
         }
     }
 }
@@ -374,6 +370,10 @@ fn match_principal_request(q: ast::Request, entities: &Entities<PartialValue>, s
 /// nested sets which could not be translated)
 /// TODO: collect statistics about how frequently there are early exits
 fn do_test(input: FuzzTargetInput) -> Option<()> {
+    let mut conn = Client::connect(DB_PATH, NoTls)
+        .expect("Postgres client should exist with a user 'postgres', password 'postgres', and database 'db_fuzzer'");
+
+
     let mut policyset = ast::PolicySet::new();
     policyset.add_static(input.policy.into()).unwrap();
     debug!("Schema: {}\n", input.schema.schemafile_string());
@@ -381,19 +381,18 @@ fn do_test(input: FuzzTargetInput) -> Option<()> {
 
     let schema: cedar_policy::Schema = cedar_policy::Schema(input.schema.try_into().ok()?);
 
-
     let exts = Extensions::none();
     let entities_evaled = input.entities.eval_attrs(&exts).ok()?;
 
     // create the entities schema in postgres
-    let id_map = create_entities_schema(&entities_evaled, &schema)?;
+    let id_map = create_entities_schema(&entities_evaled, &schema, &mut conn)?;
 
     for q in input.principal_requests {
-        match_principal_request(q, &entities_evaled, &schema, &policyset, &id_map);
+        match_principal_request(q, &entities_evaled, &schema, &policyset, &id_map, &mut conn);
     }
 
     for q in input.resource_requests {
-        match_resource_request(q, &entities_evaled, &schema, &policyset, &id_map);
+        match_resource_request(q, &entities_evaled, &schema, &policyset, &id_map, &mut conn);
     }
 
     Some(())
@@ -403,6 +402,8 @@ fn do_test(input: FuzzTargetInput) -> Option<()> {
 // hierarchy/policy/requests
 fuzz_target!(|input: FuzzTargetInput| {
     initialize_log();
+    // TODO: log whether do_test returned Some(()) or None
+    // to keep track of how many tests actually go "all the way"
     do_test(input);
 });
 

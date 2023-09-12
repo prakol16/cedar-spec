@@ -65,6 +65,13 @@ test = false
 doc = false
 
 [[bin]]
+name = "expr-to-sql-expr"
+path = "fuzz_targets/expr-to-sql-expr.rs"
+test = false
+doc = false
+required-features = ["sql"]
+
+[[bin]]
 name = "partial-eval-to-sql-translation"
 path = "fuzz_targets/partial-eval-to-sql-translation.rs"
 test = false

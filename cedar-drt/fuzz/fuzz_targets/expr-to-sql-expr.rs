@@ -17,8 +17,9 @@
 #![no_main]
 
 use cedar_drt::initialize_log;
+use cedar_drt_inner::sql::{get_conn, create_entities_schema, create_unknown_pool};
 use cedar_policy_generators::{schema::Schema, abac::{Type, ABACRequest}, settings::ABACSettings, hierarchy::HierarchyGenerator};
-use cedar_policy_core::entities::{Entities, TCComputation};
+use cedar_policy_core::{entities::{Entities, TCComputation}, extensions::Extensions};
 use cedar_policy_core::ast;
 use libfuzzer_sys::{fuzz_target, arbitrary::{Arbitrary, Unstructured, self}};
 
@@ -119,7 +120,19 @@ fn drop_some_entities(entities: Entities, u: &mut Unstructured<'_>) -> arbitrary
 }
 
 fn do_test(input: FuzzTargetInput) -> Option<()> {
-    None
+    let mut conn = get_conn();
+    let unk_pool = input.schema.unknown_pool.clone();
+    let schema: cedar_policy::Schema = cedar_policy::Schema(input.schema.try_into().ok()?);
+
+    let exts = Extensions::none();
+    let entities_evaled = input.entities.eval_attrs(&exts).ok()?;
+
+    // create the entities schema in postgres
+    let _id_map = create_entities_schema(&entities_evaled, &schema, &mut conn)?;
+    // add the unknown pool to the schema as well
+    create_unknown_pool(unk_pool, &mut conn)?;
+
+    Some(())
 }
 
 // The main fuzz target.

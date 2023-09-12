@@ -84,6 +84,12 @@ impl UnknownPool {
             .cloned()
     }
 
+    /// Iterate over the unknowns in a pool, consuming it
+    pub fn into_iter(self) -> impl Iterator<Item = (String, Type, Value)> {
+        self.unknowns.take().into_iter()
+            .map(|(x, (y, z))| (x, y, z))
+    }
+
     /// Iterate over the unknowns in the pool, getting the name of the unknown
     /// and its `Type`
     pub fn unknowns(self) -> impl Iterator<Item = (String, Type)> {

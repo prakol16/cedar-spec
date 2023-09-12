@@ -16,11 +16,11 @@
 
 use cedar_db::{
     dump_entities::{self, DumpEntitiesError},
-    query_expr::QueryExprError,
+    query_expr::{QueryExprError, QueryType, QueryPrimitiveType},
 };
-use cedar_policy::{EntityTypeName, PartialValue};
+use cedar_policy::{EntityTypeName, PartialValue, Value};
 use cedar_policy_core::entities::Entities;
-use cedar_policy_generators::collections::HashMap;
+use cedar_policy_generators::{collections::HashMap, abac::{UnknownPool, Type}};
 use log::debug;
 use postgres::{error::SqlState, Client, NoTls};
 use smol_str::SmolStr;
@@ -100,6 +100,50 @@ fn suppress_dumpentities_error<T>(
             );
         }
     }
+}
+
+fn type_to_query_type(ty: Type) -> Option<QueryType> {
+    match ty {
+        Type::Bool => Some(QueryPrimitiveType::Bool.into()),
+        Type::Long => Some(QueryPrimitiveType::Long.into()),
+        Type::String => Some(QueryPrimitiveType::StringOrEntity.into()),
+        Type::Set(Some(x)) => type_to_query_type(*x)?.promote().ok(),
+        Type::Record => Some(QueryPrimitiveType::Record.into()),
+        Type::Entity => Some(QueryPrimitiveType::StringOrEntity.into()),
+        Type::Set(_) => None,
+        Type::IPAddr => None,
+        Type::Decimal => None,
+    }
+}
+
+pub fn create_unknown_pool(unknown_pool: UnknownPool, conn: &mut Client) -> Option<()> {
+    let values = unknown_pool
+        .into_iter()
+        .map(|(col, ty, val)| Some((SmolStr::from(col), val, type_to_query_type(ty)?)))
+        .collect::<Option<Vec<(SmolStr, Value, QueryType)>>>()?;
+
+    if values.is_empty() {
+        return Some(());
+    }
+
+    let stmts = suppress_dumpentities_error(
+        dump_entities::create_table_of_values_postgres(
+            "unknown_pool",
+            values.into_iter()
+        ),
+        || "creating unknown pool".into(),
+    )?.join(";");
+
+    if stmts.contains('\0') {
+        // Postgres does not support null characters in UTF-8 strings, despite it being a valid UTF-8 character
+        // This is due to the backend implementation being in C
+        // We ignore this error
+        return None;
+    }
+
+    debug!("Running postgres query: {}", stmts);
+    suppress_postgres_error(conn.batch_execute(&stmts),
+        || format!("creating and populating unknown pool with query {}", stmts))
 }
 
 /// Given the entities, creates the schema "cedar" in postgres and adds the entities to the database

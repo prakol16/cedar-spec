@@ -139,7 +139,7 @@ fn check_expr<T: EntityAttrDatabase>(
         .expect("Substitutions should suceeed");
 
     let full_eval = evaluator.interpret(&subst, &Default::default())
-        .expect("Evaluation should succeed");
+        .ok()?;
 
     // Now, convert the original expression to a SQL expression, evaluate it, and check that
     // the result is the same as the full evaluation

@@ -16,9 +16,9 @@
 
 #![no_main]
 
-use cedar_db::{query_expr::UnknownType, query_builder::translate_expr_to_expr_with_bindings, dump_entities::{EntityTableIden, EntityAncestryTableIden, AncestryCols, CedarSQLSchemaName}, expr_to_query::InByTable};
+use cedar_db::{query_expr::{UnknownType, QueryExprError}, query_builder::{translate_expr_to_expr_with_bindings, QueryBuilderError}, dump_entities::{EntityTableIden, EntityAncestryTableIden, AncestryCols, CedarSQLSchemaName}, expr_to_query::InByTable};
 use cedar_drt::initialize_log;
-use cedar_drt_inner::sql::{get_conn, create_entities_schema, create_unknown_pool, UnknownPoolIden};
+use cedar_drt_inner::sql::{get_conn, create_entities_schema, create_unknown_pool, UnknownPoolIden, suppress_postgres_error, RawSQLValue};
 use cedar_policy::{PartialValue, Value, EntityTypeName};
 use cedar_policy_generators::{schema::Schema, abac::{Type, ABACRequest}, settings::ABACSettings, hierarchy::HierarchyGenerator, collections::HashMap};
 use cedar_policy_core::{entities::{Entities, TCComputation, EntityAttrDatabase}, extensions::Extensions, evaluator::Evaluator, ast::{Expr, Literal, EntityType}};
@@ -138,7 +138,7 @@ fn check_expr<T: EntityAttrDatabase>(
     let subst = e.substitute(&substitutions.clone().into())
         .expect("Substitutions should suceeed");
 
-    let _ = evaluator.interpret(&subst, &Default::default())
+    let full_eval = evaluator.interpret(&subst, &Default::default())
         .expect("Evaluation should succeed");
 
     // Now, convert the original expression to a SQL expression, evaluate it, and check that
@@ -148,9 +148,22 @@ fn check_expr<T: EntityAttrDatabase>(
                 .expect("Id map should have an id for every entity in the schema")
                 .clone())
     };
-    let expr_with_bindings =
-        translate_expr_to_expr_with_bindings(e, schema, table_names, &renamings.clone().into())
-        .expect("Translation should succeed");
+    let expr_with_bindings = match translate_expr_to_expr_with_bindings(e, schema, table_names, &renamings.clone().into()) {
+        Ok(e) => e,
+        // These errors are explicitly allowed
+        // Sometimes the input generator generates expressions that do not type check
+        Err(QueryBuilderError::QueryExprError(QueryExprError::ValidationError(_)))
+        // Action types cannot be translated
+        | Err(QueryBuilderError::QueryExprError(QueryExprError::ActionTypeAppears(_)))
+        | Err(QueryBuilderError::QueryExprError(QueryExprError::ActionAttribute { .. }))
+        // Nested sets are not supported
+        | Err(QueryBuilderError::QueryExprError(QueryExprError::NestedSetsError))
+        // We cannot compare between certain "incomparable" types which contain sets at an inner level
+        // (e.g. a record containing a set)
+        | Err(QueryBuilderError::QueryExprError(QueryExprError::IncomparableTypes)) => return None,
+        Err(err) => panic!("Unexpected error while translating expression {} to sql query: {:?}", e, err)
+    };
+
     let mut sql = expr_with_bindings.to_sql_expr_query(InByTable(|ty0, ty1| {
         if schema.can_be_descendant(ty0, ty1) {
             Ok(Some((
@@ -164,9 +177,17 @@ fn check_expr<T: EntityAttrDatabase>(
     }), table_names)
         .expect("Building the query should succeed");
     sql.from_as((CedarSQLSchemaName, UnknownPoolIden), UnknownPoolIden);
-    let _ = sql.to_string(PostgresQueryBuilder);
 
+    let sql_string = sql.to_string(PostgresQueryBuilder);
+    if sql_string.contains('\0') {
+        // We cannot execute queries with null bytes in them
+        return None;
+    }
+    let row = suppress_postgres_error(conn.query_one(&sql_string, &[]),
+        || format!("executing query {}", sql_string))?;
+    let val: RawSQLValue = row.get(0);
 
+    assert_eq!(val, RawSQLValue(full_eval.into()), "The expression {} did not match the sQL query: {}", e, sql_string);
 
     Some(())
 }

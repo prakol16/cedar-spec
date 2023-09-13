@@ -11,6 +11,7 @@ use crate::size_hint_utils::{size_hint_for_choose, size_hint_for_range, size_hin
 use crate::{accum, gen, gen_inner, uniform};
 use arbitrary::{Arbitrary, Unstructured};
 use cedar_policy_core::ast;
+use cedar_policy_core::entities::SchemaType;
 use smol_str::SmolStr;
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -248,8 +249,10 @@ impl<'a> ExprGenerator<'a> {
     ) -> Result<ast::Expr> {
         if self.should_generate_unknown(max_depth, u)? {
             let v = self.generate_value_for_type(target_type, max_depth, u)?;
+            let ty = SchemaType::from_value(&v,
+                &cedar_policy_core::extensions::Extensions::all_available());
             let name = self.unknown_pool.alloc(target_type.clone(), v);
-            Ok(ast::Expr::unknown(name))
+            Ok(ast::Expr::unknown_with_type(name, ty))
         } else {
             match target_type {
                 Type::Bool => {

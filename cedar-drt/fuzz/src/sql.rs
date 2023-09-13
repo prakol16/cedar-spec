@@ -16,13 +16,14 @@
 
 use cedar_db::{
     dump_entities::{self, DumpEntitiesError},
-    query_expr::{QueryExprError, QueryType, QueryPrimitiveType},
+    query_expr::{QueryExprError, QueryType, QueryPrimitiveType}, sql_common::SQLValue,
 };
 use cedar_policy::{EntityTypeName, PartialValue, Value};
 use cedar_policy_core::entities::Entities;
 use cedar_policy_generators::{collections::HashMap, abac::{UnknownPool, Type}};
 use log::debug;
-use postgres::{error::SqlState, Client, NoTls};
+use postgres::{error::SqlState, Client, NoTls, types::FromSql};
+use ref_cast::RefCast;
 use sea_query::Iden;
 use smol_str::SmolStr;
 
@@ -179,4 +180,24 @@ pub fn create_entities_schema(
         )
     })?;
     Some(id_map.into())
+}
+
+/// A wrapper around SQLValue which does not do escaping when converting from JSON
+#[derive(Debug, Clone, PartialEq, RefCast)]
+#[repr(transparent)]
+pub struct RawSQLValue(pub SQLValue);
+
+impl<'a> FromSql<'a> for RawSQLValue {
+    fn from_sql(ty: &postgres::types::Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if serde_json::Value::accepts(ty) {
+            let json = serde_json::Value::from_sql(ty, raw)?;
+            Ok(Self(SQLValue::from_json_no_escape(json)))
+        } else {
+            SQLValue::from_sql(ty, raw).map(RawSQLValue)
+        }
+    }
+
+    fn accepts(ty: &postgres::types::Type) -> bool {
+        SQLValue::accepts(ty)
+    }
 }

@@ -23,7 +23,12 @@ use cedar_policy_core::entities::Entities;
 use cedar_policy_generators::{collections::HashMap, abac::{UnknownPool, Type}};
 use log::debug;
 use postgres::{error::SqlState, Client, NoTls};
+use sea_query::Iden;
 use smol_str::SmolStr;
+
+#[derive(Iden, Debug, Clone, Copy)]
+#[iden = "unknown_pool"]
+pub struct UnknownPoolIden;
 
 pub const DB_PATH: &str = "host=localhost user=postgres dbname=db_fuzzer password=postgres";
 

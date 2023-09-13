@@ -28,6 +28,7 @@ rayon = { version = "1.5", optional = true }
 rand = { version = "0.8", optional = true }
 clap = { version = "4.0", features = ["derive"], optional = true }
 rand_chacha = { version = "0.3", optional = true }
+sea-query = { version = "0.31.0", git = "https://github.com/prakol16/sea-query.git", features = ["backend-postgres", "backend-sqlite", "postgres-array", "thread-safe", "with-json"], optional = true }
 
 [dependencies.uuid]
 version = "1.3.1"
@@ -35,7 +36,7 @@ features = ["v4", "fast-rng"]
 
 [features]
 prt = ["dep:rayon", "dep:rand", "dep:clap", "dep:rand_chacha"]
-sql = ["dep:cedar-db", "dep:postgres"]
+sql = ["dep:cedar-db", "dep:postgres", "dep:sea-query"]
 
 [lib]
 path = "src/lib.rs"

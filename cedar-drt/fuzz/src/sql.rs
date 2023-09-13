@@ -16,7 +16,7 @@
 
 use cedar_db::{
     dump_entities::{self, DumpEntitiesError},
-    query_expr::{QueryExprError, QueryType, QueryPrimitiveType}, sql_common::SQLValue,
+    query_expr::{QueryExprError, QueryType, QueryPrimitiveType}, sql_common::SQLValue, query_builder::QueryBuilderError,
 };
 use cedar_policy::{EntityTypeName, PartialValue, Value};
 use cedar_policy_core::entities::Entities;
@@ -180,6 +180,26 @@ pub fn create_entities_schema(
         )
     })?;
     Some(id_map.into())
+}
+
+/// Decide if the error is expected when translating a cedar policy to a SQL query
+pub fn is_expected_error(err: &QueryBuilderError) -> bool {
+    match err {
+        // These errors are explicitly allowed
+        // Sometimes the input generator generates expressions that do not type check
+        QueryBuilderError::QueryExprError(QueryExprError::ValidationError(_))
+        // Action types cannot be translated
+        | QueryBuilderError::QueryExprError(QueryExprError::ActionTypeAppears(_))
+        | QueryBuilderError::QueryExprError(QueryExprError::ActionAttribute { .. })
+        // Nested sets are not supported
+        | QueryBuilderError::QueryExprError(QueryExprError::NestedSetsError)
+        // We cannot compare between certain "incomparable" types which contain sets at an inner level
+        // (e.g. a record containing a set)
+        | QueryBuilderError::QueryExprError(QueryExprError::IncomparableTypes)
+        // Incorrect HasAttr calls cannot be translated
+        | QueryBuilderError::QueryExprError(QueryExprError::HasAttrError(_, _)) => true,
+        _ => false,
+    }
 }
 
 /// A wrapper around SQLValue which does not do escaping when converting from JSON

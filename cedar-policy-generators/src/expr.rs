@@ -236,6 +236,20 @@ impl<'a> ExprGenerator<'a> {
         }
     }
 
+    fn type_to_schema_type(ty: &Type) -> Option<SchemaType> {
+        match ty {
+            Type::Bool => Some(SchemaType::Bool),
+            Type::Long => Some(SchemaType::Long),
+            Type::String => Some(SchemaType::String),
+            Type::Set(s) => Some(SchemaType::Set { element_ty: Box::new(Self::type_to_schema_type(s.as_deref()?)?) }),
+            Type::Record => Some(SchemaType::Record { attrs: Default::default() }),
+            Type::Entity => None,
+            // TODO: extension functions
+            Type::IPAddr => None,
+            Type::Decimal => None,
+        }
+    }
+
     /// get an arbitrary expression of a given type conforming to the schema
     ///
     /// `max_depth`: maximum size (i.e., depth) of the expression.
@@ -251,6 +265,11 @@ impl<'a> ExprGenerator<'a> {
             let v = self.generate_value_for_type(target_type, max_depth, u)?;
             let ty = SchemaType::from_value(&v,
                 &cedar_policy_core::extensions::Extensions::all_available());
+            let ty = if ty == Some(SchemaType::EmptySet) {
+                // Since the typechecker will reject empty sets (but in this case, we know the actual type)
+                // we can annotate with the actual type
+                Self::type_to_schema_type(target_type)
+            } else { ty };
             let name = self.unknown_pool.alloc(target_type.clone(), v);
             Ok(ast::Expr::unknown_with_type(name, ty))
         } else {

@@ -16,7 +16,7 @@
 
 #![no_main]
 
-use cedar_db::{dump_entities::{EntityTableIden, EntityAncestryTableIden, AncestryCols}, query_builder::{translate_response_core, QueryBuilderError}, expr_to_query::InByTable, query_expr::QueryExprError, sql_common::EntitySQLId};
+use cedar_db::{dump_entities::{EntityTableIden, EntityAncestryTableIden, AncestryCols}, query_builder::translate_response_core, expr_to_query::InByTable, sql_common::EntitySQLId};
 use cedar_drt::initialize_log;
 use cedar_policy::{PartialValue, EntityTypeName, Decision};
 use cedar_policy_generators::{schema::Schema, abac::ABACPolicy, settings::ABACSettings, hierarchy::HierarchyGenerator, collections::{HashSet, HashMap}};
@@ -183,18 +183,13 @@ fn check_residual_query_eq_allowed_set(
             }
             Some(())
         },
-        // These errors are explicitly allowed
-        // Sometimes the input generator generates expressions that do not type check
-        Err(QueryBuilderError::QueryExprError(QueryExprError::ValidationError(_)))
-        // Action types cannot be translated
-        | Err(QueryBuilderError::QueryExprError(QueryExprError::ActionTypeAppears(_)))
-        | Err(QueryBuilderError::QueryExprError(QueryExprError::ActionAttribute { .. }))
-        // Nested sets are not supported
-        | Err(QueryBuilderError::QueryExprError(QueryExprError::NestedSetsError))
-        // We cannot compare between certain "incomparable" types which contain sets at an inner level
-        // (e.g. a record containing a set)
-        | Err(QueryBuilderError::QueryExprError(QueryExprError::IncomparableTypes)) => None,
-        Err(e) => panic!("Unexpected error while translating response {} to sql query: {:?}", res.residuals.get(&ast::PolicyID::from_string("")).unwrap().to_string(), e),
+        Err(err) => {
+            if is_expected_error(&err) {
+                None
+            } else {
+                panic!("Unexpected error while translating response {} to sql query: {:?}", res.residuals.get(&ast::PolicyID::from_string("")).unwrap().to_string(), err)
+            }
+        }
     }
 }
 

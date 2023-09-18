@@ -16,6 +16,8 @@
 
 #![no_main]
 
+use std::collections::BTreeMap;
+
 use cedar_db::{query_expr::UnknownType, query_builder::translate_expr_to_expr_with_bindings, dump_entities::{EntityTableIden, EntityAncestryTableIden, AncestryCols, CedarSQLSchemaName}, expr_to_query::InByTable};
 use cedar_drt::initialize_log;
 use cedar_drt_inner::sql::{get_conn, create_entities_schema, create_unknown_pool, UnknownPoolIden, suppress_postgres_error, RawSQLValue, is_expected_error};
@@ -124,6 +126,25 @@ fn drop_some_entities(entities: Entities, u: &mut Unstructured<'_>) -> arbitrary
     }
 }
 
+/// Given a value, return the corresponding value with all entity uids (recursively) converted to strings
+fn entity_uid_to_string(e: &ast::Value) -> ast::Value {
+    match e {
+        Value::Lit(Literal::EntityUID(u)) => {
+            // We need to convert the entity uid to a string
+            // because this is how entity uids are represented
+            let id: &str = u.eid().as_ref();
+            id.into()
+        },
+        Value::Set(vals) => Value::set(vals.iter().map(entity_uid_to_string)),
+        Value::Record(pairs) =>
+            pairs.iter()
+                .map(|(k, v)| (k.clone(), entity_uid_to_string(v)))
+                .collect::<BTreeMap<_, _>>()
+                .into(),
+        _ => e.clone(),
+    }
+}
+
 /// Checks that the given expression, when evaluated, results in the same value
 /// as if we translate the expression to SQL and evaluate it in postgres.
 fn check_expr<T: EntityAttrDatabase>(
@@ -182,14 +203,7 @@ fn check_expr<T: EntityAttrDatabase>(
         || format!("executing query {}, which is a translation of {}", sql_string, e))?;
     let val: RawSQLValue = row.get(0);
 
-    let converted_full_eval = match full_eval {
-        Value::Lit(Literal::EntityUID(u)) => {
-            // We need to convert the entity uid to a string because this is how entity uids are represented
-            let id: &str = u.eid().as_ref();
-            id.into()
-        },
-        full_eval => full_eval,
-    };
+    let converted_full_eval = entity_uid_to_string(&full_eval);
     assert_eq!(val, RawSQLValue(converted_full_eval.into()), "The expression {} did not match the sQL query: {}", e, sql_string);
 
     Some(())
